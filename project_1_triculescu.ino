@@ -1,71 +1,107 @@
-//this code takes an angle input from positive to negative 720 and rotates the dc motor
-//connected by the h-bridge to the desired angle. new angle inputs and adjustments can be sent continuously.
-//this is accomplished by reading how many ticks the encoder wheel has completed, translating them into rotations of the drive shaft. 
+//pins for ir read and motor control
+#define IR_OUTER 11
+#define IR_INNER 12
+#define BACK_PIN 5
+#define FORW_PIN 9
 
-int inputPin = 12; 
-int fwdPin = 10; 
-int bwdPin = 9;
-int isObstacle = LOW; //low means obstacle present
-int countStates = 0;
-int countTicks = 0;
-int totalTicks;
-int inputAngle;
-float totalRotations;
+//class variables
+int t1;
+int t2;
+float angleRequested = 0.0;
+float currentAngle = 0.0;
+float angleChange = 0.0;
+float errorCount = 0.0;
+int ticks;
+int ticksRequested;
+int outerIR;
+int innerIR;
+float kp = 4;
+char byteArray[6];
 
-void setup(){ //setup pins and serial
-  pinMode(fwdPin, OUTPUT);
-  pinMode(bwdPin, OUTPUT);
-  pinMode(inputPin, INPUT);
-  Serial.begin(9600);
+void setup(){
+  Serial.begin(9600); //output to main computer serial 
+  Serial1.begin(9600); //pi UART communication serial input
+  pinMode(FORW_PIN, OUTPUT); //servo pins for motor
+  pinMode(BACK_PIN, OUTPUT);
+  pinMode(IR_OUTER, INPUT_PULLUP);//outer and inner IR sensors setup
+  pinMode(IR_INNER, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(IR_OUTER), tickInterrupt, CHANGE);//attach interrupt to outer IR sensor (main sensor)
+  currentAngle = 0; //reset so whatever angle is current is 0
+  t1 = millis(); //start timer
 }
+
 void loop(){
-  if(Serial.available() > 0){//if serial is available, parse angle input
-    inputAngle = Serial.parseInt();
-    if((inputAngle > 720)||(inputAngle < -720)){
-      Serial.println("Angle out of bounds, -721<angle<721");
+  //take from UART serial six bytes:
+  //(0xFF) (0xFF) (direction) (magnitude/256) (magnitude%256) (checkSum)
+  while(true){
+    if(Serial1.available() >= 6){
+      for ( char i = 0; i < 7; i++ ){
+        byteArray[i] = Serial1.read(); //read six bytes from serial
+      }
+      
+      if(byteArray[0] == char(0xFF) && byteArray[1] == char(0xFF)){ //if first two bytes read are FF, proceed
+        char checkSum = (byteArray[2] + byteArray[3] + byteArray[4])%256; //calculate checkSum
+        if(checkSum == byteArray[5]){ //check checkSum
+          angleRequested = (byteArray[3] * 256) + byteArray[4]; //calculate angle
+          if(1 == byteArray[2])
+            angleRequested *= -1;
+          Serial.println(angleRequested);
+        }
+        else{
+          Serial.write("errorCount in checkSum.");
+        }
+      }
+      else{
+        Serial.write("errorCount in header.");
+      }  
     }
-    else{
-      totalRotations = ((float)inputAngle)/360.0; //calculate how many total rotations there will be done
-      //720/360=2 would mean a maximum of two full rotations
-      numberOfTicks = (int)(totalRotations*75); //multiply the number of rotations by 75, the number of ticks for one full rotation
-      //75*2 = maximum of 150 full ticks of encoder wheel, representing two full rotations of drive shaft
-    }
+    //check if angle is out of bounds
+    if(angleRequested > 720)
+      angleRequested = 720;
+    else if(angleRequested < -720)
+      angleRequested = -720;
+    //convert ticks to angle
+    currentAngle = getAngle(ticks);
+    //update the timer and run motors
+    updateTimer();
   }
-  //stop motors and set ticks and number of ticks back to zero when limit is reached
-  //both are zero by default so this will keep them zero until a numberofTicks value is set
-  if(countTicks == abs(numberOfTicks)){
-    analogWrite(fwdPin, 127);//stop motors
-    analogWrite(bwdPin, 127);
-    countTicks = 0;//reset variables
-    numberOfTicks = 0;
+}
+//set the velocity of the motors based on forward or backward movement request
+void setVelocity(float velocity) {
+  if (velocity >= 127) {
+    analogWrite(BACK_PIN, 0);
+    analogWrite(FORW_PIN, (velocity - 127)*2);
   }
-  //otherwise, either move the motors backwards or forwards
-  else if(numberOfTicks != 0){
-    //move motors forward and stop backwards mosfets if numberOfTicks >0
-    if(numberOfTicks > 0){
-      analogWrite(bwdPin, 127);
-      analogWrite(fwdPin, 250);
-    }
-    //otherwise, stop fwd mosfets and move backwards
-    else if(numberOfTicks < 0){
-      analogWrite(fwdPin, 127);
-      analogWrite(bwdPin, 250);
-    }
+  if (velocity < 127) {
+    analogWrite(FORW_PIN, 0);
+    analogWrite(BACK_PIN, (127 - velocity)*2);
   }
-  //read the sensor input
-  isObstacle = digitalRead(inputPin);
-  if(numberOfTicks !=0){//if an angle input is actually set, then increment states if object detected (white part of wheel)
-    if (isObstacle){
-      //do nothing if object is not detected
-    }
-    else{
-      countStates++;
-    }
+}
+//if the outer sensor and inner sensor are not equal, increment ticks
+void tickInterrupt(){
+  //when the ir sensors are equal, it means a backwards mark is being hit
+  //this is proven by the quadrature encoder model
+  innerIR = digitalRead(IR_INNER);
+  outerIR = digitalRead(IR_OUTER);
+  if(outerIR != innerIR)
+    ticks++;
+  else
+    ticks--; 
+}
+//update the timer
+void updateTimer(){
+  t1 = millis();
+  if(t1 - t2 >= 25){//if difference greater than 25ms, set velocity
+    //this removes potential error (like debouncing)
+    setVelocity(pController(angleRequested, currentAngle) + 127);
+    t2 = t1;
   }
-  //after white part of wheel has been detected twice, a rotation of the small shaft has completed, increment ticks
-  if(countStates == 2){
-    countTicks++;//increment ticks, as one tick has finished (full rotation of encoder wheel)
-    countStates = 0;
-  }
-  delay(5);// small delay as to not flood serial
+}
+//get the angle, conversion is 1.2 degrees per tick
+float getAngle(int count){
+  return count * (90 / 75.7); //1.2 degrees ~ 90/75
+}
+//pController code, kp factor multiplied by required angle - current angle
+float pController(float angleReq, float angleCur){
+  return kp * (angleReq - angleCur);
 }
